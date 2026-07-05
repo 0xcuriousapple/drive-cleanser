@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+data/
+credentials.json
+client_secret*.json
+token.json
+*.log
+.env
+.DS_Store
+# stray captured terminal output
+stat
+*.part

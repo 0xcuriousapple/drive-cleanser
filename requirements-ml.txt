@@ -1,0 +1,8 @@
+# Optional ML stack — enables CLIP embeddings (semantic search, zero-shot
+# classification) and InsightFace (face detection/clustering).
+# ~2GB of downloads; models fetched on first use.
+torch>=2.2
+open_clip_torch>=2.24
+insightface>=0.7.3
+onnxruntime>=1.17
+scikit-learn>=1.4

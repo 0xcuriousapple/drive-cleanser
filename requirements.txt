@@ -1,0 +1,10 @@
+# Core — everything needed to index, dedup, classify (heuristics), review, execute.
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pillow>=10.0
+pillow-heif>=0.15
+imagehash>=4.3
+numpy>=1.26
+google-api-python-client>=2.120
+google-auth-oauthlib>=1.2
+google-auth-httplib2>=0.2
