@@ -128,10 +128,24 @@ const pages = {
   async duplicates(sub) {
     const d = await api('/duplicates' + (sub ? `?kind=${sub}` : ''));
     const tabs = ['', 'exact', 'near', 'video'];
-    main.innerHTML = `<h1>Duplicates <span class="muted">(${d.groups.length} groups)</span></h1>
+    const totalOthers = d.groups.reduce((s, g) => s + g.members.filter(m => m.file_id !== g.keep_file_id).length, 0);
+    const anyVideo = d.groups.some(g => g.kind === 'video');
+    main.innerHTML = `<h1>Duplicates <span class="muted">(${d.groups.length} unresolved groups)</span></h1>
       <div class="tabs">${tabs.map(t => `<button data-t="${t}" class="${(sub || '') === t ? 'active' : ''}">${t || 'all'}</button>`).join('')}</div>
+      ${d.groups.length ? `<div class="row actionbar">
+        <button class="danger" id="dup-all">Resolve ALL shown: keep ✓ choices, trash ${totalOthers} cop${totalOthers === 1 ? 'y' : 'ies'}…</button>
+        <span class="muted">or resolve group by group below — every trash is undoable from Activity</span>
+      </div>` : ''}
       <div id="groups"></div>`;
     main.querySelectorAll('.tabs button').forEach(b => b.onclick = () => { location.hash = '#duplicates/' + b.dataset.t; });
+    const btn = $('#dup-all');
+    if (btn) btn.onclick = async () => {
+      if (!confirm(`Resolve all ${d.groups.length} groups shown?\n\nKeeps each group's ✓ file and moves ${totalOthers} duplicate cop${totalOthers === 1 ? 'y' : 'ies'} to the undoable trash.`)) return;
+      if (anyVideo && !confirm('Some groups are VIDEOS. Second confirmation: trash video duplicates too?')) return;
+      const r = await api('/duplicates/resolve-all', { method: 'POST', body: { kind: sub || null } });
+      toast(`Resolved ${r.groups_resolved} groups — ${r.trashed} files trashed${r.errors ? `, ${r.errors} errors` : ''}`, 6000);
+      render();
+    };
     $('#groups').innerHTML = d.groups.map(g => `
       <div class="panel dupgroup">
         <div><span class="badge ${g.kind === 'exact' ? 'ok' : 'warn'}">${g.kind}</span>
@@ -140,13 +154,16 @@ const pages = {
         <div class="members">${g.members.map(m => `
           <div class="dupmember ${m.file_id === g.keep_file_id ? 'keep' : ''}">
             <div onclick="showFile(${m.file_id})" style="cursor:pointer">${thumb(m.file_id)}</div>
-            <div class="meta">${esc(m.name)}<br>${m.width || '?'}×${m.height || '?'} · ${fmtSize(m.size)} · q=${m.quality ?? '—'}
-              ${m.status === 'trashed' ? '<br><span class="badge danger">trashed</span>' : ''}</div>
-            ${m.file_id === g.keep_file_id
-              ? '<span class="badge ok">✓ keep this</span>'
-              : `<button class="sm" onclick="setKeep(${g.id},${m.file_id})">keep this instead</button>`}
+            <div class="meta">${esc(m.name)}<br>${m.width || '?'}×${m.height || '?'} · ${fmtSize(m.size)} · q=${m.quality ?? '—'}</div>
+            <div class="row" style="gap:4px">
+              ${m.file_id === g.keep_file_id
+                ? '<span class="badge ok">✓ will keep</span>'
+                : `<button class="sm" onclick="setKeep(${g.id},${m.file_id})" title="mark as the keeper">✓ prefer</button>`}
+              <button class="sm danger" onclick="resolveGroup(${g.id},${m.file_id},${g.members.length - 1},'${g.kind}')"
+                title="keep this file, trash the other ${g.members.length - 1}">keep only this</button>
+            </div>
           </div>`).join('')}</div>
-      </div>`).join('') || '<p class="muted">No duplicate groups found. Run a scan first.</p>';
+      </div>`).join('') || '<p class="muted">No unresolved duplicate groups 🎉</p>';
   },
 
   async people() {
@@ -270,6 +287,51 @@ const pages = {
     };
   },
 
+  async record() {
+    const s = await api('/record/summary');
+    const reasons = Object.entries(s.by_reason).map(([k, v]) =>
+      `<span class="badge">${esc(k)}: ${v}</span>`).join(' ') || '<span class="muted">nothing deleted yet</span>';
+    main.innerHTML = `<h1>Deletion record</h1>
+      <p class="muted">Permanent registry of everything removed — filename, path, and checksums (md5/sha256)
+      plus perceptual hash — so you can filter the same files on any other drive or backup.</p>
+      <div class="cards" style="margin:14px 0">
+        <div class="stat"><div class="n">${s.deleted_files}</div><div class="l">files deleted (via app)</div></div>
+        <div class="stat"><div class="n">${(s.deleted_bytes / 1e9).toFixed(2)} GB</div><div class="l">space reclaimed</div></div>
+        <div class="stat"><div class="n">${s.with_checksum}</div><div class="l">have checksums</div></div>
+        <div class="stat"><div class="n">${(s.local_trash_bytes / 1e9).toFixed(2)} GB</div><div class="l">sitting in local trash</div></div>
+      </div>
+      <div class="panel"><h2 style="margin-top:0">By reason</h2>${reasons}</div>
+      <div class="panel">
+        <h2 style="margin-top:0">Export the record</h2>
+        <p class="muted">Writes <b>deleted-record.sqlite</b> + <b>deleted-record.csv</b> into ${esc(s.export_dir)}.
+        Optionally merge the download-phase duplicate report (files never downloaded because an identical copy was kept):</p>
+        <div class="row" style="margin:10px 0">
+          <input type="text" id="rec-report" value="~/DriveDump/Photos/skipped-duplicates.jsonl" style="flex:1;min-width:300px">
+          <label class="muted"><input type="checkbox" id="rec-inc" checked> include</label>
+        </div>
+        <button class="primary" id="rec-export">Export deletion record</button>
+        <div id="rec-out" style="margin-top:10px"></div>
+      </div>
+      <div class="panel">
+        <h2 style="margin-top:0">Local trash</h2>
+        <p class="muted">Deleted files are still recoverable at <b>${esc(s.local_trash_dir)}</b>
+        (${(s.local_trash_bytes / 1e9).toFixed(2)} GB). This app never permanently deletes anything —
+        when you've exported the record and are sure, empty it yourself in Terminal:</p>
+        <pre class="kv" style="background:var(--panel2);padding:10px;border-radius:8px;overflow-x:auto">rm -rf "${esc(s.local_trash_dir)}"</pre>
+      </div>`;
+    $('#rec-export').onclick = async () => {
+      const body = $('#rec-inc').checked ? { download_report: $('#rec-report').value } : {};
+      const r = await api('/record/export', { method: 'POST', body }).catch(e => { toast(e.message, 8000); });
+      if (!r) return;
+      $('#rec-out').innerHTML = `<span class="badge ok">exported</span><br>
+        Deletion record: ${r.deleted_rows} deleted + ${r.skipped_duplicate_rows} download-skipped →
+        <b>${esc(r.sqlite)}</b> + csv<br>
+        Duplication record: ${r.duplication_rows} rows (every group member, keeper + fate) →
+        <b>${esc(r.dup_sqlite)}</b> + csv`;
+      toast('Records exported');
+    };
+  },
+
   async activity() {
     const [d, dr] = await Promise.all([api('/actions'), api('/recommendations?status=approved&page_size=200')]);
     main.innerHTML = `<h1>Activity</h1>
@@ -348,6 +410,14 @@ window.undoAction = async id => {
     .catch(e => toast('Undo failed: ' + e.message, 6000));
 };
 
+window.resolveGroup = async (gid, fid, others, kind) => {
+  if (!confirm(`Keep this file and move the other ${others} cop${others === 1 ? 'y' : 'ies'} to trash?\n\nUndoable from the Activity tab.`)) return;
+  if (kind === 'video' && !confirm('These are VIDEOS — second confirmation to trash the other copies?')) return;
+  const r = await api(`/duplicates/${gid}/resolve`, { method: 'POST', body: { keep_file_id: fid } });
+  toast(`Group resolved — ${r.executed.length} trashed${r.errors.length ? `, ${r.errors.length} errors` : ''}`);
+  render();
+};
+
 window.setKeep = async (gid, fid) => {
   await api(`/duplicates/${gid}/keep`, { method: 'POST', body: { file_id: fid } });
   toast('Keep choice updated'); render();
@@ -369,11 +439,11 @@ function clGridInit(files, r) {
   $('#cl-results').innerHTML = `
     <h2>${files.length} files contain none of your selected people
       <span class="muted">(${r.kept_files} of ${r.total_with_faces} face-files kept — someone you know is in them)</span></h2>
-    <div class="row" style="margin-bottom:10px">
+    <div class="row actionbar">
       <button id="cl-selall">Select all (⌘A)</button>
       <button id="cl-selnone">None (esc)</button>
       <button class="danger" id="cl-trash">Trash selected (⌫)…</button>
-      <span class="muted" id="cl-count">0 selected · click / shift+click ranges / ⌘click toggle / arrows+shift / space preview</span>
+      <span class="muted" id="cl-count">0 selected · click toggles · shift+click / shift+arrows add ranges · space preview</span>
     </div>
     <div class="grid" id="cl-grid"></div><div id="cl-more"></div>`;
   clRenderChunk();
@@ -417,30 +487,43 @@ function clSetSel(ids) {
 }
 
 function clFocusTo(idx, extend) {
+  // Selection is ADDITIVE everywhere: plain arrows only move the focus ring
+  // (your selection is never wiped by navigating); shift+arrows ADD the
+  // anchor..focus range to the selection.
   idx = Math.max(0, Math.min(clG.files.length - 1, idx));
   while (idx >= clG.rendered) clRenderChunk();   // ensure target is in the DOM
   document.querySelector('.tile.focused')?.classList.remove('focused');
   clG.focus = idx;
   if (extend) {
     const [a, b] = [Math.min(clG.anchor, idx), Math.max(clG.anchor, idx)];
-    clSetSel(clG.files.slice(a, b + 1).map(f => f.id));
+    const next = new Set(clG.sel);
+    for (const f of clG.files.slice(a, b + 1)) next.add(f.id);
+    clSetSel([...next]);
   } else {
-    clG.anchor = idx;
-    clSetSel([clG.files[idx].id]);
+    clG.anchor = idx;   // plain move: selection untouched, anchor follows focus
   }
   const el = $('#clf-' + clG.files[idx].id);
   if (el) { el.classList.add('focused'); el.scrollIntoView({ block: 'nearest' }); }
 }
 
 window.clClick = (ev, idx) => {
-  if (ev.shiftKey) { clFocusTo(idx, true); }
-  else if (ev.metaKey || ev.ctrlKey) {
-    const id = clG.files[idx].id;
+  const id = clG.files[idx].id;
+  document.querySelector('.tile.focused')?.classList.remove('focused');
+  if (ev.shiftKey) {
+    // add the whole range to the existing selection
+    const [a, b] = [Math.min(clG.anchor, idx), Math.max(clG.anchor, idx)];
+    const next = new Set(clG.sel);
+    for (const f of clG.files.slice(a, b + 1)) next.add(f.id);
+    clG.focus = idx;
+    clSetSel([...next]);
+  } else {
+    // plain click toggles this one file in/out — never clears the rest
     const next = new Set(clG.sel);
     next.has(id) ? next.delete(id) : next.add(id);
     clG.anchor = clG.focus = idx;
     clSetSel([...next]);
-  } else clFocusTo(idx, false);
+  }
+  $('#clf-' + id)?.classList.add('focused');
 };
 
 function clCols() {

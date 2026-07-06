@@ -84,6 +84,9 @@ input[type=text] { width: 100%; }
   color: var(--ok); font-size: 11px; font-weight: 700; }
 .facechip .cap { font-size: 11px; color: var(--muted); margin-top: 5px; }
 
+.actionbar { position: sticky; top: 54px; z-index: 9; background: var(--bg);
+  padding: 10px 0; margin-bottom: 10px; border-bottom: 1px solid var(--border); }
+
 .tile.selectable { position: relative; user-select: none; }
 .tile.selectable.sel { outline: 2px solid var(--danger); }
 .tile.selectable.sel::after { content: "🗑"; position: absolute; top: 6px; right: 8px; font-size: 16px; }

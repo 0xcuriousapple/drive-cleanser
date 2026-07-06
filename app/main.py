@@ -173,12 +173,80 @@ def duplicates(kind: str | None = None):
     if kind:
         where, params = "WHERE g.kind=?", (kind,)
     groups = db.rows(f"SELECT * FROM dup_groups g {where} ORDER BY g.id", params)
+    out = []
     for g in groups:
+        # trashed members drop out live; a group with <2 surviving copies is
+        # no longer a duplicate problem and disappears from the list
         g["members"] = db.rows(
             "SELECT m.file_id, m.similarity, f.name, f.kind, f.size, f.width, f.height, "
             "f.quality, f.taken_time, f.status FROM dup_members m JOIN files f ON f.id=m.file_id "
-            "WHERE m.group_id=? ORDER BY m.similarity DESC", (g["id"],))
-    return {"groups": groups}
+            "WHERE m.group_id=? AND f.status != 'trashed' ORDER BY m.similarity DESC", (g["id"],))
+        if len(g["members"]) >= 2:
+            out.append(g)
+    return {"groups": out}
+
+
+def _live_members(group_id: int) -> list[dict]:
+    return db.rows(
+        "SELECT m.file_id, m.similarity, f.name, f.kind FROM dup_members m "
+        "JOIN files f ON f.id=m.file_id "
+        "WHERE m.group_id=? AND f.status != 'trashed' ORDER BY m.similarity DESC", (group_id,))
+
+
+def _trash_others(group_id: int, keep_file_id: int) -> list[int]:
+    """Approved+executed trash recs for every live member except the keeper."""
+    rec_ids = []
+    keep_name = db.row("SELECT name FROM files WHERE id=?", (keep_file_id,))["name"]
+    for m in _live_members(group_id):
+        if m["file_id"] == keep_file_id:
+            continue
+        cur = db.execute(
+            "INSERT INTO recommendations(file_id, collection, action, confidence, explanation, "
+            "status, decided_at) VALUES(?,?,?,?,?,'approved',datetime('now'))",
+            (m["file_id"], "Duplicate Candidates", "trash", 1.0,
+             f"User resolved duplicate group {group_id}: keeping '{keep_name}'."))
+        rec_ids.append(cur.lastrowid)
+    return rec_ids
+
+
+class ResolveBody(BaseModel):
+    keep_file_id: int
+
+
+@app.post("/api/duplicates/{group_id}/resolve")
+def resolve_group(group_id: int, body: ResolveBody):
+    """Keep exactly one member; trash the rest (undoable, audited)."""
+    members = _live_members(group_id)
+    if len(members) < 2:
+        raise HTTPException(400, "group has fewer than 2 remaining files")
+    if body.keep_file_id not in {m["file_id"] for m in members}:
+        raise HTTPException(400, "keep_file_id is not a live member of this group")
+    db.execute("UPDATE dup_groups SET keep_file_id=? WHERE id=?", (body.keep_file_id, group_id))
+    return actions.execute(_trash_others(group_id, body.keep_file_id))
+
+
+class ResolveAllBody(BaseModel):
+    kind: str | None = None
+
+
+@app.post("/api/duplicates/resolve-all")
+def resolve_all(body: ResolveAllBody):
+    """Resolve every group (of the given kind) using its current keeper choice."""
+    where, params = "", ()
+    if body.kind:
+        where, params = "WHERE kind=?", (body.kind,)
+    results = {"groups_resolved": 0, "trashed": 0, "errors": 0, "skipped_groups": 0}
+    for g in db.rows(f"SELECT id, keep_file_id FROM dup_groups {where}", params):
+        members = _live_members(g["id"])
+        if len(members) < 2:
+            continue
+        live_ids = {m["file_id"] for m in members}
+        keeper = g["keep_file_id"] if g["keep_file_id"] in live_ids else members[0]["file_id"]
+        res = actions.execute(_trash_others(g["id"], keeper))
+        results["groups_resolved"] += 1
+        results["trashed"] += len(res["executed"])
+        results["errors"] += len(res["errors"])
+    return results
 
 
 class KeepBody(BaseModel):
@@ -379,6 +447,8 @@ def recommendations(collection: str | None = None, status: str = "pending",
     where, params = ["r.status=?"], [status]
     if collection:
         where.append("r.collection=?"); params.append(collection)
+    if status == "pending":
+        where.append("f.status != 'trashed'")   # queues shrink live as files are trashed
     rows = db.rows(
         f"SELECT r.*, f.name, f.kind, f.size, f.width, f.height, f.taken_time, f.quality "
         f"FROM recommendations r JOIN files f ON f.id=r.file_id WHERE {' AND '.join(where)} "
@@ -431,5 +501,150 @@ def undo(action_id: int):
         raise HTTPException(500, str(e))
 
 
+# ---------- deletion record (permanent registry of what was removed) ----------
+def _trashed_rows():
+    """One row per trashed file with its latest trash action + reason."""
+    return db.rows("""
+        SELECT f.name, f.path, f.kind, f.size, f.md5, f.sha256, f.phash,
+               a.executed_at AS deleted_at,
+               coalesce(r.collection, 'manual') AS reason,
+               r.explanation AS detail
+        FROM files f
+        LEFT JOIN actions_log a ON a.id = (
+            SELECT max(a2.id) FROM actions_log a2
+            WHERE a2.file_id = f.id AND a2.undone_at IS NULL)
+        LEFT JOIN recommendations r ON r.id = a.rec_id
+        WHERE f.status = 'trashed'
+        ORDER BY f.path""")
+
+
+@app.get("/api/record/summary")
+def record_summary():
+    rows = _trashed_rows()
+    by_reason = {}
+    for r in rows:
+        by_reason[r["reason"]] = by_reason.get(r["reason"], 0) + 1
+    trash_dir = config.LOCAL_TRASH_DIR
+    disk = sum(p.stat().st_size for p in trash_dir.rglob("*") if p.is_file()) if trash_dir.exists() else 0
+    return {"deleted_files": len(rows),
+            "deleted_bytes": sum(r["size"] or 0 for r in rows),
+            "by_reason": by_reason,
+            "with_checksum": sum(1 for r in rows if r["md5"] or r["sha256"]),
+            "local_trash_dir": str(trash_dir),
+            "local_trash_bytes": disk,
+            "export_dir": db.get_setting("localfs_root") or str(config.DATA_DIR)}
+
+
+class RecordExportBody(BaseModel):
+    download_report: str | None = None   # optional path to skipped-duplicates.jsonl
+
+
+@app.post("/api/record/export")
+def record_export(body: RecordExportBody):
+    import csv
+    import json as _json
+    import sqlite3 as _sq
+    root = Path(db.get_setting("localfs_root") or config.DATA_DIR)
+    rows = _trashed_rows()
+
+    # duplicates never downloaded (from the download phase), if a report is given
+    skipped = []
+    if body.download_report:
+        rp = Path(body.download_report).expanduser()
+        if not rp.exists():
+            raise HTTPException(400, f"report not found: {rp}")
+        for line in rp.read_text().splitlines():
+            try:
+                skipped.append(_json.loads(line))
+            except ValueError:
+                continue
+
+    sq_path = root / "deleted-record.sqlite"
+    csv_path = root / "deleted-record.csv"
+    sq_path.unlink(missing_ok=True)
+    con = _sq.connect(sq_path)
+    con.executescript("""
+        CREATE TABLE deleted (
+          name TEXT, path TEXT, kind TEXT, size INTEGER,
+          md5 TEXT, sha256 TEXT, phash TEXT,
+          deleted_at TEXT, reason TEXT, detail TEXT);
+        CREATE INDEX idx_deleted_md5 ON deleted(md5);
+        CREATE INDEX idx_deleted_sha ON deleted(sha256);
+        CREATE TABLE skipped_duplicates (
+          drive_path TEXT, md5 TEXT, size INTEGER, kept_copy TEXT);
+        CREATE INDEX idx_skip_md5 ON skipped_duplicates(md5);
+    """)
+    con.executemany("INSERT INTO deleted VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    [(r["name"], r["path"], r["kind"], r["size"], r["md5"], r["sha256"],
+                      r["phash"], r["deleted_at"], r["reason"], r["detail"]) for r in rows])
+    con.executemany("INSERT INTO skipped_duplicates VALUES(?,?,?,?)",
+                    [(s.get("drive_path"), s.get("md5"), s.get("size"), s.get("kept_copy"))
+                     for s in skipped])
+    con.commit()
+    con.close()
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(["name", "path", "kind", "size", "md5", "sha256", "phash",
+                    "deleted_at", "reason", "detail"])
+        for r in rows:
+            w.writerow([r["name"], r["path"], r["kind"], r["size"], r["md5"], r["sha256"],
+                        r["phash"], r["deleted_at"], r["reason"], r["detail"]])
+
+    # duplication record: every group member ever detected, keeper + fate included
+    dup_rows = db.rows("""
+        SELECT g.id AS group_id, g.kind,
+               (m.file_id = g.keep_file_id) AS is_keeper,
+               m.similarity, f.name, f.path, f.kind AS file_kind, f.size,
+               f.md5, f.sha256, f.phash,
+               CASE f.status WHEN 'trashed' THEN 'trashed' ELSE 'kept' END AS fate
+        FROM dup_groups g
+        JOIN dup_members m ON m.group_id = g.id
+        JOIN files f ON f.id = m.file_id
+        ORDER BY g.id, is_keeper DESC, m.similarity DESC""")
+    dsq_path = root / "duplication-record.sqlite"
+    dcsv_path = root / "duplication-record.csv"
+    dsq_path.unlink(missing_ok=True)
+    con = _sq.connect(dsq_path)
+    con.executescript("""
+        CREATE TABLE duplicates (
+          group_id INTEGER, kind TEXT, is_keeper INTEGER, similarity REAL,
+          name TEXT, path TEXT, file_kind TEXT, size INTEGER,
+          md5 TEXT, sha256 TEXT, phash TEXT, fate TEXT);
+        CREATE INDEX idx_dup_md5 ON duplicates(md5);
+        CREATE INDEX idx_dup_sha ON duplicates(sha256);
+        CREATE INDEX idx_dup_group ON duplicates(group_id);
+    """)
+    con.executemany("INSERT INTO duplicates VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    [(r["group_id"], r["kind"], r["is_keeper"], r["similarity"], r["name"],
+                      r["path"], r["file_kind"], r["size"], r["md5"], r["sha256"], r["phash"],
+                      r["fate"]) for r in dup_rows])
+    con.commit()
+    con.close()
+    with open(dcsv_path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(["group_id", "kind", "is_keeper", "similarity", "name", "path",
+                    "file_kind", "size", "md5", "sha256", "phash", "fate"])
+        for r in dup_rows:
+            w.writerow([r["group_id"], r["kind"], r["is_keeper"], r["similarity"], r["name"],
+                        r["path"], r["file_kind"], r["size"], r["md5"], r["sha256"], r["phash"],
+                        r["fate"]])
+
+    return {"deleted_rows": len(rows), "skipped_duplicate_rows": len(skipped),
+            "duplication_rows": len(dup_rows),
+            "sqlite": str(sq_path), "csv": str(csv_path),
+            "dup_sqlite": str(dsq_path), "dup_csv": str(dcsv_path)}
+
+
 # ---------- static UI (mounted last so /api wins) ----------
+@app.middleware("http")
+async def no_ui_cache(request, call_next):
+    """UI files must never be cached — stale app.js against a new API is the
+    classic 'why is the page old' bug. API responses are dynamic anyway."""
+    resp = await call_next(request)
+    if not request.url.path.startswith("/api/"):
+        resp.headers["Cache-Control"] = "no-cache, must-revalidate"
+    return resp
+
+
 app.mount("/", StaticFiles(directory=Path(__file__).parent / "web", html=True), name="web")
